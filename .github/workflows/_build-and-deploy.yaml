@@ -41,23 +41,20 @@ jobs:
       - name: Determine environment
         id: env
         run: |
-          GIT_REF="${{ github.ref }}"
-          if [[ "$GIT_REF" == refs/tags/v* ]]; then
-            echo "name=prd" >> "$GITHUB_OUTPUT"
-          elif [[ "$GIT_REF" == refs/heads/release_* ]]; then
-            echo "name=hmg" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=dev" >> "$GITHUB_OUTPUT"
-          fi
+          case "${{ github.ref_name }}" in
+            main)    echo "name=prd" >> "$GITHUB_OUTPUT" ;;
+            hmg)     echo "name=hmg" >> "$GITHUB_OUTPUT" ;;
+            develop) echo "name=dev" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "Unexpected branch ${{ github.ref_name }}" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Resolve version
         id: version
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="$(cat VERSION | tr -d '[:space:]')"
-          fi
+          VERSION="$(cat VERSION | tr -d '[:space:]')"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Set image tag
