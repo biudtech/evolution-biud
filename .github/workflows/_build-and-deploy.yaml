@@ -1,0 +1,159 @@
+name: Build and Deploy
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  vet:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      environment: ${{ steps.env.outputs.name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine environment
+        id: env
+        run: |
+          GIT_REF="${{ github.ref }}"
+          if [[ "$GIT_REF" == refs/tags/v* ]]; then
+            echo "name=prd" >> "$GITHUB_OUTPUT"
+          elif [[ "$GIT_REF" == refs/heads/release_* ]]; then
+            echo "name=hmg" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(cat VERSION | tr -d '[:space:]')"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=${{ steps.env.outputs.name }}-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ghcr.io/biudtech/evolution-go:${{ steps.tag.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout infra-k8s
+        uses: actions/checkout@v6
+        with:
+          repository: biudtech/infra-k8s
+          token: ${{ secrets.INFRA_DEPLOY_TOKEN }}
+          path: infra-k8s
+
+      - name: Setup kustomize
+        uses: imranismail/setup-kustomize@v2
+        with:
+          kustomize-version: "5.4.3"
+
+      - name: Resolve namespace
+        id: kube
+        run: |
+          ENV="${{ needs.build.outputs.environment }}"
+          case "$ENV" in
+            prd) echo "namespace=evolution-go"     >> "$GITHUB_OUTPUT" ;;
+            hmg) echo "namespace=evolution-go-hmg" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "namespace=evolution-go-dev" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Update image tag
+        env:
+          OVERLAY: ${{ needs.build.outputs.environment }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          cd "infra-k8s/apps/evolution-go/overlays/${OVERLAY}"
+          kustomize edit set image "app=ghcr.io/biudtech/evolution-go:${TAG}"
+
+      - name: Commit and push
+        run: |
+          cd infra-k8s
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --staged --quiet || git commit -m "chore(${{ needs.build.outputs.environment }}): update evolution-go to ${{ needs.build.outputs.tag }}"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            echo "Push failed, attempt $i/5..."
+            sleep $((i * 3))
+          done
+
+      - name: Setup kubeconfig PRD
+        if: needs.build.outputs.environment == 'prd'
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_PRD }}
+
+      - name: Setup kubeconfig HMG
+        if: needs.build.outputs.environment != 'prd'
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_HMG }}
+
+      - name: Deploy
+        env:
+          OVERLAY: ${{ needs.build.outputs.environment }}
+        run: |
+          kustomize build "infra-k8s/apps/evolution-go/overlays/${OVERLAY}" | \
+            kubectl apply --validate=false -f -
+
+      - name: Verify rollout
+        env:
+          NS: ${{ steps.kube.outputs.namespace }}
+        run: |
+          kubectl rollout status "deployment/evolution-go" -n "${NS}" --timeout=600s
