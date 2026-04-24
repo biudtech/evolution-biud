@@ -13,6 +13,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -33,6 +35,8 @@ jobs:
       environment: ${{ steps.env.outputs.name }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Determine environment
         id: env
